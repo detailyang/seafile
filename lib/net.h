@@ -26,12 +26,12 @@
 #endif
 
 #ifdef WIN32
-    #define ECONNREFUSED WSAECONNREFUSED
-    #define ECONNRESET   WSAECONNRESET
-    #define EHOSTUNREACH WSAEHOSTUNREACH
-    #define EINPROGRESS  WSAEINPROGRESS
-    #define ENOTCONN     WSAENOTCONN
-    #define EWOULDBLOCK  WSAEWOULDBLOCK
+    /* #define ECONNREFUSED WSAECONNREFUSED */
+    /* #define ECONNRESET   WSAECONNRESET */
+    /* #define EHOSTUNREACH WSAEHOSTUNREACH */
+    /* #define EINPROGRESS  WSAEINPROGRESS */
+    /* #define ENOTCONN     WSAENOTCONN */
+    /* #define EWOULDBLOCK  WSAEWOULDBLOCK */
     #define sockerrno WSAGetLastError( )
 #else
     #include <errno.h>
@@ -40,8 +40,6 @@
 
 #ifdef WIN32
 extern int inet_aton(const char *string, struct in_addr *addr);
-extern const char *inet_ntop(int af, const void *src, char *dst, size_t size);
-extern int inet_pton(int af, const char *src, void *dst);
 #endif
 
 evutil_socket_t ccnet_net_open_tcp (const struct sockaddr *sa, int nonblock);

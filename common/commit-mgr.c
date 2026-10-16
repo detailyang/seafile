@@ -2,8 +2,9 @@
 
 #include "common.h"
 
+#include "log.h"
+
 #include <jansson.h>
-#include <openssl/sha.h>
 
 #include "utils.h"
 #include "db.h"
@@ -11,7 +12,6 @@
 
 #include "seafile-session.h"
 #include "commit-mgr.h"
-#include "seaf-utils.h"
 
 #define MAX_TIME_SKEW 259200    /* 3 days */
 
@@ -38,23 +38,25 @@ commit_from_json_object (const char *id, json_t *object);
 
 static void compute_commit_id (SeafCommit* commit)
 {
-    SHA_CTX ctx;
+    GChecksum *ctx = g_checksum_new(G_CHECKSUM_SHA1);
     uint8_t sha1[20];    
     gint64 ctime_n;
 
-    SHA1_Init (&ctx);
-    SHA1_Update (&ctx, commit->root_id, 41);
-    SHA1_Update (&ctx, commit->creator_id, 41);
+    g_checksum_update (ctx, (guchar *)commit->root_id, 41);
+    g_checksum_update (ctx, (guchar *)commit->creator_id, 41);
     if (commit->creator_name)
-        SHA1_Update (&ctx, commit->creator_name, strlen(commit->creator_name)+1);
-    SHA1_Update (&ctx, commit->desc, strlen(commit->desc)+1);
+        g_checksum_update (ctx, (guchar *)commit->creator_name, strlen(commit->creator_name)+1);
+    g_checksum_update (ctx, (guchar *)commit->desc, strlen(commit->desc)+1);
 
     /* convert to network byte order */
     ctime_n = hton64 (commit->ctime);
-    SHA1_Update (&ctx, &ctime_n, sizeof(ctime_n));
-    SHA1_Final (sha1, &ctx);
+    g_checksum_update (ctx, (guchar *)&ctime_n, sizeof(ctime_n));
+
+    gsize len = 20;
+    g_checksum_get_digest (ctx, sha1, &len);
     
     rawdata_to_hex (sha1, commit->commit_id, 20);
+    g_checksum_free (ctx);
 }
 
 SeafCommit*
@@ -138,10 +140,7 @@ seaf_commit_from_data (const char *id, char *data, gsize len)
 
         object = json_loadb (data, len, 0, &jerror);
         if (!object) {
-            if (jerror.text)
-                g_warning ("Failed to load commit json: %s.\n", jerror.text);
-            else
-                g_warning ("Failed to load commit json.\n");
+            seaf_warning ("Failed to load commit json: %s.\n", jerror.text);
             return NULL;
         }
     }
@@ -162,8 +161,13 @@ seaf_commit_free (SeafCommit *commit)
     if (commit->second_parent_id) g_free (commit->second_parent_id);
     if (commit->repo_name) g_free (commit->repo_name);
     if (commit->repo_desc) g_free (commit->repo_desc);
+    if (commit->device_name) g_free (commit->device_name);
+    g_free (commit->client_version);
     g_free (commit->magic);
     g_free (commit->random_key);
+    g_free (commit->pwd_hash);
+    g_free (commit->pwd_hash_algo);
+    g_free (commit->pwd_hash_params);
     g_free (commit);
 }
 
@@ -202,19 +206,19 @@ seaf_commit_manager_init (SeafCommitManager *mgr)
 
 #ifdef FULL_FEATURE
     if (seaf_obj_store_init (mgr->obj_store, TRUE, seaf->ev_mgr) < 0) {
-        g_warning ("[commit mgr] Failed to init commit object store.\n");
+        seaf_warning ("[commit mgr] Failed to init commit object store.\n");
         return -1;
     }
 #else
     if (seaf_obj_store_init (mgr->obj_store, FALSE, NULL) < 0) {
-        g_warning ("[commit mgr] Failed to init commit object store.\n");
+        seaf_warning ("[commit mgr] Failed to init commit object store.\n");
         return -1;
     }
 #endif
 
 #else
     if (seaf_obj_store_init (mgr->obj_store, TRUE, seaf->ev_mgr) < 0) {
-        g_warning ("[commit mgr] Failed to init commit object store.\n");
+        seaf_warning ("[commit mgr] Failed to init commit object store.\n");
         return -1;
     }
 #endif
@@ -350,7 +354,7 @@ insert_parent_commit (GList **list, GHashTable *hash,
     if (!p) {
         if (allow_truncate)
             return 0;
-        g_warning ("Failed to find commit %s\n", parent_id);
+        seaf_warning ("Failed to find commit %s\n", parent_id);
         return -1;
     }
 
@@ -359,7 +363,7 @@ insert_parent_commit (GList **list, GHashTable *hash,
                                            NULL);
 
     key = g_strdup (parent_id);
-    g_hash_table_insert (hash, key, key);
+    g_hash_table_replace (hash, key, key);
 
     return 0;
 }
@@ -371,7 +375,8 @@ seaf_commit_manager_traverse_commit_tree_with_limit (SeafCommitManager *mgr,
                                                      const char *head,
                                                      CommitTraverseFunc func,
                                                      int limit,
-                                                     void *data)
+                                                     void *data,
+                                                     gboolean skip_errors)
 {
     SeafCommit *commit;
     GList *list = NULL;
@@ -383,7 +388,7 @@ seaf_commit_manager_traverse_commit_tree_with_limit (SeafCommitManager *mgr,
 
     commit = seaf_commit_manager_get_commit (mgr, repo_id, version, head);
     if (!commit) {
-        g_warning ("Failed to find commit %s.\n", head);
+        seaf_warning ("Failed to find commit %s.\n", head);
         return FALSE;
     }
 
@@ -392,7 +397,7 @@ seaf_commit_manager_traverse_commit_tree_with_limit (SeafCommitManager *mgr,
                                            NULL);
 
     char *key = g_strdup (commit->commit_id);
-    g_hash_table_insert (commit_hash, key, key);
+    g_hash_table_replace (commit_hash, key, key);
 
     int count = 0;
     while (list) {
@@ -401,9 +406,11 @@ seaf_commit_manager_traverse_commit_tree_with_limit (SeafCommitManager *mgr,
         list = g_list_delete_link (list, list);
 
         if (!func (commit, data, &stop)) {
-            seaf_commit_unref (commit);
-            ret = FALSE;
-            goto out;
+            if (!skip_errors) {
+                seaf_commit_unref (commit);
+                ret = FALSE;
+                goto out;
+            }
         }
 
         /* Stop when limit is reached. If limit < 0, there is no limit; */
@@ -423,17 +430,21 @@ seaf_commit_manager_traverse_commit_tree_with_limit (SeafCommitManager *mgr,
         if (commit->parent_id) {
             if (insert_parent_commit (&list, commit_hash, repo_id, version,
                                       commit->parent_id, FALSE) < 0) {
-                seaf_commit_unref (commit);
-                ret = FALSE;
-                goto out;
+                if (!skip_errors) {
+                    seaf_commit_unref (commit);
+                    ret = FALSE;
+                    goto out;
+                }
             }
         }
         if (commit->second_parent_id) {
             if (insert_parent_commit (&list, commit_hash, repo_id, version,
                                       commit->second_parent_id, FALSE) < 0) {
-                seaf_commit_unref (commit);
-                ret = FALSE;
-                goto out;
+                if (!skip_errors) {
+                    seaf_commit_unref (commit);
+                    ret = FALSE;
+                    goto out;
+                }
             }
         }
         seaf_commit_unref (commit);
@@ -466,9 +477,10 @@ traverse_commit_tree_common (SeafCommitManager *mgr,
 
     commit = seaf_commit_manager_get_commit (mgr, repo_id, version, head);
     if (!commit) {
-        g_warning ("Failed to find commit %s.\n", head);
-        if (!skip_errors)
-            return FALSE;
+        seaf_warning ("Failed to find commit %s.\n", head);
+        // For head commit corrupted, directly return FALSE
+        // user can repair head by fsck then retraverse the tree
+        return FALSE;
     }
 
     /* A hash table for recording id of traversed commits. */
@@ -479,7 +491,7 @@ traverse_commit_tree_common (SeafCommitManager *mgr,
                                            NULL);
 
     char *key = g_strdup (commit->commit_id);
-    g_hash_table_insert (commit_hash, key, key);
+    g_hash_table_replace (commit_hash, key, key);
 
     while (list) {
         gboolean stop = FALSE;
@@ -487,7 +499,7 @@ traverse_commit_tree_common (SeafCommitManager *mgr,
         list = g_list_delete_link (list, list);
 
         if (!func (commit, data, &stop)) {
-            g_warning("[comit-mgr] CommitTraverseFunc failed\n");
+            seaf_warning("[comit-mgr] CommitTraverseFunc failed\n");
 
             /* If skip errors, continue to traverse parents. */
             if (!skip_errors) {
@@ -507,7 +519,7 @@ traverse_commit_tree_common (SeafCommitManager *mgr,
         if (commit->parent_id) {
             if (insert_parent_commit (&list, commit_hash, repo_id, version,
                                       commit->parent_id, allow_truncate) < 0) {
-                g_warning("[comit-mgr] insert parent commit failed\n");
+                seaf_warning("[comit-mgr] insert parent commit failed\n");
 
                 /* If skip errors, try insert second parent. */
                 if (!skip_errors) {
@@ -520,7 +532,7 @@ traverse_commit_tree_common (SeafCommitManager *mgr,
         if (commit->second_parent_id) {
             if (insert_parent_commit (&list, commit_hash, repo_id, version,
                                       commit->second_parent_id, allow_truncate) < 0) {
-                g_warning("[comit-mgr]insert second parent commit failed\n");
+                seaf_warning("[comit-mgr]insert second parent commit failed\n");
 
                 if (!skip_errors) {
                     seaf_commit_unref (commit);
@@ -610,15 +622,28 @@ commit_to_json_object (SeafCommit *commit)
                                    commit->repo_desc);
     json_object_set_string_or_null_member (object, "repo_category",
                                            commit->repo_category);
+    if (commit->device_name)
+        json_object_set_string_member (object, "device_name", commit->device_name);
+
+    if (commit->client_version)
+        json_object_set_string_member (object, "client_version", commit->client_version);
+
     if (commit->encrypted)
         json_object_set_string_member (object, "encrypted", "true");
 
     if (commit->encrypted) {
         json_object_set_int_member (object, "enc_version", commit->enc_version);
-        if (commit->enc_version >= 1)
+        if (commit->enc_version >= 1 && !commit->pwd_hash)
             json_object_set_string_member (object, "magic", commit->magic);
-        if (commit->enc_version == 2)
+        if (commit->enc_version >= 2)
             json_object_set_string_member (object, "key", commit->random_key);
+        if (commit->enc_version >= 3)
+            json_object_set_string_member (object, "salt", commit->salt);
+        if (commit->pwd_hash) {
+            json_object_set_string_member (object, "pwd_hash", commit->pwd_hash);
+            json_object_set_string_member (object, "pwd_hash_algo", commit->pwd_hash_algo);
+            json_object_set_string_member (object, "pwd_hash_params", commit->pwd_hash_params);
+        }
     }
     if (commit->no_local_history)
         json_object_set_int_member (object, "no_local_history", 1);
@@ -648,10 +673,16 @@ commit_from_json_object (const char *commit_id, json_t *object)
     const char *repo_name;
     const char *repo_desc;
     const char *repo_category;
+    const char *device_name;
+    const char *client_version;
     const char *encrypted = NULL;
     int enc_version = 0;
     const char *magic = NULL;
     const char *random_key = NULL;
+    const char *salt = NULL;
+    const char *pwd_hash = NULL;
+    const char *pwd_hash_algo = NULL;
+    const char *pwd_hash_params = NULL;
     int no_local_history = 0;
     int version = 0;
     int conflict = 0, new_merge = 0;
@@ -670,8 +701,15 @@ commit_from_json_object (const char *commit_id, json_t *object)
     second_parent_id = json_object_get_string_or_null_member (object, "second_parent_id");
 
     repo_name = json_object_get_string_member (object, "repo_name");
+    if (!repo_name)
+        repo_name = "";
     repo_desc = json_object_get_string_member (object, "repo_desc");
+    if (!repo_desc)
+        repo_desc = "";
     repo_category = json_object_get_string_or_null_member (object, "repo_category");
+    device_name = json_object_get_string_or_null_member (object, "device_name");
+    client_version = json_object_get_string_or_null_member (object, "client_version");
+
     if (json_object_has_member (object, "encrypted"))
         encrypted = json_object_get_string_or_null_member (object, "encrypted");
 
@@ -679,10 +717,15 @@ commit_from_json_object (const char *commit_id, json_t *object)
         && json_object_has_member (object, "enc_version")) {
         enc_version = json_object_get_int_member (object, "enc_version");
         magic = json_object_get_string_member (object, "magic");
+        pwd_hash = json_object_get_string_member (object, "pwd_hash");
+        pwd_hash_algo = json_object_get_string_member (object, "pwd_hash_algo");
+        pwd_hash_params = json_object_get_string_member (object, "pwd_hash_params");
     }
 
-    if (enc_version == 2)
+    if (enc_version >= 2)
         random_key = json_object_get_string_member (object, "key");
+    if (enc_version >= 3)
+        salt = json_object_get_string_member (object, "salt");
 
     if (json_object_has_member (object, "no_local_history"))
         no_local_history = json_object_get_int_member (object, "no_local_history");
@@ -700,13 +743,16 @@ commit_from_json_object (const char *commit_id, json_t *object)
 
 
     /* sanity check for incoming values. */
-    if (!repo_id || strlen(repo_id) != 36 ||
-        !root_id || strlen(root_id) != 40 ||
+    if (!repo_id || !is_uuid_valid(repo_id)  ||
+        !root_id || !is_object_id_valid(root_id) ||
         !creator || strlen(creator) != 40 ||
-        (parent_id && strlen(parent_id) != 40) ||
-        (second_parent_id && strlen(second_parent_id) != 40) ||
-        (enc_version >= 1 && magic == NULL))
+        (parent_id && !is_object_id_valid(parent_id)) ||
+        (second_parent_id && !is_object_id_valid(second_parent_id)))
         return commit;
+
+    // If pwd_hash is set, the magic field is no longer included in the commit of the newly created repo.
+    if (!magic)
+        magic = pwd_hash;
 
     switch (enc_version) {
     case 0:
@@ -721,14 +767,30 @@ commit_from_json_object (const char *commit_id, json_t *object)
         if (!random_key || strlen(random_key) != 96)
             return NULL;
         break;
+    case 3:
+        if (!magic || strlen(magic) != 64)
+            return NULL;
+        if (!random_key || strlen(random_key) != 96)
+            return NULL;
+        if (!salt || strlen(salt) != 64)
+            return NULL;
+        break;
+    case 4:
+        if (!magic || strlen(magic) != 64)
+            return NULL;
+        if (!random_key || strlen(random_key) != 96)
+            return NULL;
+        if (!salt || strlen(salt) != 64)
+            return NULL;
+        break;
     default:
-        g_warning ("Unknown encryption version %d.\n", enc_version);
+        seaf_warning ("Unknown encryption version %d.\n", enc_version);
         return NULL;
     }
 
-    char *creator_name_l = g_ascii_strdown (creator_name, -1);
+    char *creator_name_l = creator_name ? g_ascii_strdown (creator_name, -1) : NULL;
     commit = seaf_commit_new (commit_id, repo_id, root_id,
-                              creator_name, creator, desc, ctime);
+                              creator_name_l, creator, desc, ctime);
     g_free (creator_name_l);
 
     commit->parent_id = parent_id ? g_strdup(parent_id) : NULL;
@@ -742,13 +804,22 @@ commit_from_json_object (const char *commit_id, json_t *object)
         commit->encrypted = FALSE;
     if (repo_category)
         commit->repo_category = g_strdup(repo_category);
+    commit->device_name = g_strdup(device_name);
+    commit->client_version = g_strdup(client_version);
 
     if (commit->encrypted) {
         commit->enc_version = enc_version;
-        if (enc_version >= 1)
+        if (enc_version >= 1 && !pwd_hash)
             commit->magic = g_strdup(magic);
-        if (enc_version == 2)
+        if (enc_version >= 2)
             commit->random_key = g_strdup (random_key);
+        if (enc_version >= 3)
+            commit->salt = g_strdup(salt);
+        if (pwd_hash) {
+            commit->pwd_hash = g_strdup (pwd_hash);
+            commit->pwd_hash_algo = g_strdup (pwd_hash_algo);
+            commit->pwd_hash_params = g_strdup (pwd_hash_params);
+        }
     }
     if (no_local_history)
         commit->no_local_history = TRUE;
@@ -792,10 +863,7 @@ load_commit (SeafCommitManager *mgr,
 
         object = json_loadb (data, len, 0, &jerror);
         if (!object) {
-            if (jerror.text)
-                g_warning ("Failed to load commit json object: %s.\n", jerror.text);
-            else
-                g_warning ("Failed to load commit json object.\n");
+            seaf_warning ("Failed to load commit json object: %s.\n", jerror.text);
             goto out;
         }
     }
@@ -857,4 +925,11 @@ delete_commit (SeafCommitManager *mgr,
                const char *id)
 {
     seaf_obj_store_delete_obj (mgr->obj_store, repo_id, version, id);
+}
+
+int
+seaf_commit_manager_remove_store (SeafCommitManager *mgr,
+                                  const char *store_id)
+{
+    return seaf_obj_store_remove_store (mgr->obj_store, store_id);
 }

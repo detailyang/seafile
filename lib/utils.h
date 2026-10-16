@@ -3,10 +3,20 @@
 #ifndef CCNET_UTILS_H
 #define CCNET_UTILS_H
 
+#ifdef WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x500
+#endif
+#include <winsock2.h>
+#include <windows.h>
+#endif
+
+#ifndef WIN32
 #include <sys/time.h>
+#include <unistd.h>
+#endif
 #include <time.h>
 #include <stdint.h>
-#include <unistd.h>
 #include <stdarg.h>
 #include <glib.h>
 #include <glib-object.h>
@@ -31,84 +41,163 @@
 #include <errno.h>
 #include <glib/gstdio.h>
 
+#define mode_t int
+
+#define ssize_t gssize
+
 #ifndef WEXITSTATUS
 #define WEXITSTATUS(status) (((status) & 0xff00) >> 8)
 #endif
-
-/* Borrowed from libevent */
-#define ccnet_pipe_t intptr_t
-
-int pgpipe (ccnet_pipe_t handles[2]);
-#define ccnet_mkdir(a,b) g_mkdir((a),(b))
-#define ccnet_pipe(a) pgpipe((a))
-#define piperead(a,b,c) recv((a),(b),(c),0)
-#define pipewrite(a,b,c) send((a),(b),(c),0)
-#define pipeclose(a) closesocket((a))
-
-static inline int ccnet_rename(const char *oldfile, const char *newfile)
-{
-    int ret = g_rename (oldfile, newfile);
-    if (ret < 0) {
-        if (errno != EEXIST) 
-            return -1;
-        
-        ret = g_unlink(oldfile);
-        
-        if (ret < 0) {
-            g_warning("ccnet_rename failed because g_unlink failed\n");
-            return -1;
-        }
-        return g_rename(oldfile, newfile);
-    }
-    return 0;
-}
 
 #define SeafStat struct __stat64
 
 #else
 
-#define ccnet_pipe_t int
-
-#define ccnet_mkdir(a,b) g_mkdir((a),(b))
-#define ccnet_pipe(a) pipe((a))
-#define piperead(a,b,c) read((a),(b),(c))
-#define pipewrite(a,b,c) write((a),(b),(c))
-#define pipeclose(a) close((a))
-#define ccnet_rename g_rename
-
 #define SeafStat struct stat
 
 #endif
 
-#define pipereadn(a,b,c) recvn((a),(b),(c))
-#define pipewriten(a,b,c) sendn((a),(b),(c))
+#ifndef SEAFILE_CLIENT_VERSION
+#define SEAFILE_CLIENT_VERSION PACKAGE_VERSION
+#endif
+
+#ifdef WIN32
+#define USER_AGENT_OS "Windows NT"
+#endif
+
+#ifdef __APPLE__
+#define USER_AGENT_OS "Apple OS X"
+#endif
+
+#ifdef __linux__
+#define USER_AGENT_OS "Linux"
+#endif
+
+#if defined __FreeBSD__ || defined __NetBSD__ || defined __OpenBSD__ || defined __DragonFly__
+#define USER_AGENT_OS "BSD"
+#endif
 
 int seaf_stat (const char *path, SeafStat *st);
 int seaf_fstat (int fd, SeafStat *st);
 
+#ifdef WIN32
+void
+seaf_stat_from_find_data (WIN32_FIND_DATAW *fdata, SeafStat *st);
+#endif
+
 int seaf_set_file_time (const char *path, guint64 mtime);
+
+#ifdef WIN32
+wchar_t *
+win32_long_path (const char *path);
+
+/* Convert a (possible) 8.3 format path to long path */
+wchar_t *
+win32_83_path_to_long_path (const char *worktree, const wchar_t *path, int path_len);
+
+__time64_t
+file_time_to_unix_time (FILETIME *ftime);
+
+/* Delete a file, clearing the read-only attribute first if that is what
+ * blocks the deletion. Returns TRUE on success.
+ */
+gboolean
+win32_delete_file (const wchar_t *wpath);
+#endif
+
+int
+seaf_util_unlink (const char *path);
+
+int
+seaf_util_rmdir (const char *path);
+
+int
+seaf_util_mkdir (const char *path, mode_t mode);
+
+int
+seaf_util_open (const char *path, int flags);
+
+int
+seaf_util_create (const char *path, int flags, mode_t mode);
+
+int
+seaf_util_rename (const char *oldpath, const char *newpath);
+
+gboolean
+seaf_util_exists (const char *path);
+
+gint64
+seaf_util_lseek (int fd, gint64 offset, int whence);
+
+#ifdef WIN32
+
+typedef int (*DirentCallback) (wchar_t *parent,
+                               WIN32_FIND_DATAW *fdata,
+                               void *user_data,
+                               gboolean *stop);
+
+int
+traverse_directory_win32 (wchar_t *path_w,
+                          DirentCallback callback,
+                          void *user_data);
+#endif
 
 #ifndef O_BINARY
 #define O_BINARY 0
 #endif
 
+#ifdef WIN32
+#define seaf_pipe_t intptr_t
+#else
+#define seaf_pipe_t int
+#endif
+
+int
+seaf_pipe (seaf_pipe_t handles[2]);
+int
+seaf_pipe_read (seaf_pipe_t fd, char *buf, int len);
+int
+seaf_pipe_write (seaf_pipe_t fd, const char *buf, int len);
+int
+seaf_pipe_close (seaf_pipe_t fd);
+
+ssize_t seaf_pipe_readn (seaf_pipe_t fd, void *vptr, size_t n);
+ssize_t seaf_pipe_writen (seaf_pipe_t fd, const void *vptr, size_t n);
+
+typedef enum IgnoreReason {
+    IGNORE_REASON_END_SPACE_PERIOD = 0,
+    IGNORE_REASON_INVALID_CHARACTER = 1,
+} IgnoreReason;
+
+gboolean
+should_ignore_on_checkout (const char *file_path, IgnoreReason *ignore_reason);
+
 /* for debug */
 #ifndef ccnet_warning
+#ifndef WIN32
 #define ccnet_warning(fmt, ...) g_warning("%s(%d): " fmt, __FILE__, __LINE__, ##__VA_ARGS__)
+#else
+#define ccnet_warning(...) g_warning (__VA_ARGS__)
+#endif
 #endif
 
 #ifndef ccnet_error
+#ifndef WIN32
 #define ccnet_error(fmt, ...)   g_error("%s(%d): " fmt, __FILE__, __LINE__, ##__VA_ARGS__)
+#else
+#define ccnet_error(...) g_error(__VA_ARGS__)
+#endif
 #endif
 
 #ifndef ccnet_message
+#ifndef WIN32
 #define ccnet_message(fmt, ...) g_message("%s(%d): " fmt, __FILE__, __LINE__, ##__VA_ARGS__)
+#else
+#define ccnet_message(...) g_message(__VA_ARGS__)
+#endif
 #endif
 
 #define CCNET_DOMAIN g_quark_from_string("ccnet")
-
-
-struct timeval timeval_from_msec (uint64_t milliseconds);
 
 
 size_t ccnet_strlcpy (char *dst, const char *src, size_t size);
@@ -128,6 +217,8 @@ char* gen_uuid ();
 void gen_uuid_inplace (char *buf);
 gboolean is_uuid_valid (const char *uuid_str);
 
+gboolean
+is_object_id_valid (const char *obj_id);
 
 /* dir operations */
 int checkdir (const char *dir);
@@ -192,28 +283,11 @@ void nfree_string_array (char **array, int n);
 /* 64bit time */
 gint64 get_current_time();
 
-int
-ccnet_encrypt (char **data_out,
-               int *out_len,
-               const char *data_in,
-               const int in_len,
-               const char *code,
-               const int code_len);
-
-
-int
-ccnet_decrypt (char **data_out,
-               int *out_len,
-               const char *data_in,
-               const int in_len,
-               const char *code,
-               const int code_len);
-
-
 /*
  * Utility functions for converting data to/from network byte order.
  */
 
+#if !defined(__NetBSD__)
 static inline uint64_t
 bswap64 (uint64_t val)
 {
@@ -231,6 +305,7 @@ bswap64 (uint64_t val)
 
     return ret;
 }
+#endif
 
 static inline uint64_t
 hton64(uint64_t val)
@@ -342,6 +417,9 @@ json_object_set_int_member (json_t *object, const char *key, gint64 value);
 void
 clean_utf8_data (char *data, int len);
 
+char *
+normalize_utf8_path (const char *path);
+
 /* zlib related functions. */
 
 int
@@ -350,4 +428,30 @@ seaf_compress (guint8 *input, int inlen, guint8 **output, int *outlen);
 int
 seaf_decompress (guint8 *input, int inlen, guint8 **output, int *outlen);
 
+char*
+format_dir_path (const char *path);
+
+gboolean
+is_empty_string (const char *str);
+
+gboolean
+is_permission_valid (const char *perm);
+
+gboolean
+is_eml_file (const char *path);
+
+char *
+canonical_server_url (const char *url_in);
+
+gboolean
+is_path_case_conflict (const char *full_path, const char *path, char **conflict_path, GHashTable *no_case_conflict_hash);
+
+ssize_t
+seaf_getxattr (const char *path, const char *name, void *value, size_t size);
+
+int
+seaf_setxattr (const char *path, const char *name, const void *value, size_t size);
+
+int
+seaf_removexattr (const char *path, const char *name);
 #endif

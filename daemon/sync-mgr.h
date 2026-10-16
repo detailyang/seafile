@@ -9,7 +9,7 @@ typedef struct _SyncTask SyncTask;
 typedef struct _SeafSyncManager SeafSyncManager;
 typedef struct _SeafSyncManagerPriv SeafSyncManagerPriv;
 
-struct CcnetTimer;
+struct SeafTimer;
 
 struct _SyncInfo {
     char       repo_id[41];     /* the repo */
@@ -19,12 +19,23 @@ struct _SyncInfo {
     gboolean   in_sync;         /* set to FALSE when sync state is DONE or ERROR */
 
     gint       err_cnt;
+    gboolean   in_error;        /* set to TRUE if err_cnt >= 3 */
+
     gboolean   deleted_on_relay;
     gboolean   branch_deleted_on_relay;
     gboolean   repo_corrupted;
     gboolean   need_fetch;
     gboolean   need_upload;
     gboolean   need_merge;
+
+    /* Used by multipart upload. */
+    gboolean   multipart_upload;
+    gint64     total_bytes;
+    gint64     uploaded_bytes;
+    gboolean   end_multipart_upload;
+
+    gint       sync_perm_err_cnt;
+    gboolean   del_confirmation_pending;
 };
 
 enum {
@@ -40,32 +51,6 @@ enum {
     SYNC_STATE_NUM,
 };
 
-enum {
-    SYNC_ERROR_NONE,
-    SYNC_ERROR_RELAY_OFFLINE,
-    SYNC_ERROR_UPGRADE_REPO,
-    SYNC_ERROR_RELAY_REMOVED,
-    SYNC_ERROR_NOT_LOGIN,
-    SYNC_ERROR_SERVICE_DOWN,
-    SYNC_ERROR_ACCESS_DENIED,
-    SYNC_ERROR_QUOTA_FULL,
-    SYNC_ERROR_PROC_PERM_ERR,
-    SYNC_ERROR_DATA_CORRUPT,
-    SYNC_ERROR_START_UPLOAD,
-    SYNC_ERROR_UPLOAD,
-    SYNC_ERROR_START_FETCH,
-    SYNC_ERROR_FETCH,
-    SYNC_ERROR_NOREPO,
-    SYNC_ERROR_REPO_CORRUPT,
-    SYNC_ERROR_COMMIT,
-    SYNC_ERROR_MERGE,
-    SYNC_ERROR_WORKTREE_DIRTY,
-    SYNC_ERROR_DEPRECATED_SERVER,
-    SYNC_ERROR_GET_SYNC_INFO,   /* for http sync */
-    SYNC_ERROR_UNKNOWN,
-    SYNC_ERROR_NUM,
-};
-
 struct _SyncTask {
     SeafSyncManager *mgr;
     SyncInfo        *info;
@@ -76,16 +61,28 @@ struct _SyncTask {
     int              error;
     char            *tx_id;
     char            *token;
-    struct CcnetTimer *commit_timer;
+    struct SeafTimer *commit_timer;
 
-    gboolean         server_side_merge;
     gboolean         uploaded;
 
-    gboolean         http_sync;
     int              http_version;
 
     SeafRepo        *repo;  /* for convenience, only valid when in_sync. */
 };
+
+enum _SyncStatus {
+    SYNC_STATUS_NONE = 0,
+    SYNC_STATUS_SYNCING,
+    SYNC_STATUS_ERROR,
+    SYNC_STATUS_IGNORED,
+    SYNC_STATUS_SYNCED,
+    SYNC_STATUS_PAUSED,
+    SYNC_STATUS_READONLY,
+    SYNC_STATUS_LOCKED,
+    SYNC_STATUS_LOCKED_BY_ME,
+    N_SYNC_STATUS,
+};
+typedef enum _SyncStatus SyncStatus;
 
 struct _SeafileSession;
 
@@ -97,7 +94,6 @@ struct _SeafSyncManager {
     gboolean    commit_job_running;
     int         sync_interval;
 
-    GHashTable *server_states;
     GHashTable *http_server_states;
 
     /* Sent/recv bytes from all transfer tasks in this second.
@@ -135,6 +131,11 @@ seaf_sync_manager_get_sync_info (SeafSyncManager *mgr,
                                  const char *repo_id);
 
 int
+seaf_sync_manager_add_del_confirmation (SeafSyncManager *mgr,
+                                        const char *confirmation_id,
+                                        gboolean resync);
+
+int
 seaf_sync_manager_disable_auto_sync (SeafSyncManager *mgr);
 
 int
@@ -144,8 +145,56 @@ int
 seaf_sync_manager_is_auto_sync_enabled (SeafSyncManager *mgr);
 
 const char *
-sync_error_to_str (int error);
-
-const char *
 sync_state_to_str (int state);
+
+void
+seaf_sync_manager_update_active_path (SeafSyncManager *mgr,
+                                      const char *repo_id,
+                                      const char *path,
+                                      int mode,
+                                      SyncStatus status,
+                                      gboolean refresh);
+
+void
+seaf_sync_manager_delete_active_path (SeafSyncManager *mgr,
+                                      const char *repo_id,
+                                      const char *path);
+
+char *
+seaf_sync_manager_get_path_sync_status (SeafSyncManager *mgr,
+                                        const char *repo_id,
+                                        const char *path,
+                                        gboolean is_dir);
+
+char *
+seaf_sync_manager_list_active_paths_json (SeafSyncManager *mgr);
+
+int
+seaf_sync_manager_active_paths_number (SeafSyncManager *mgr);
+
+void
+seaf_sync_manager_remove_active_path_info (SeafSyncManager *mgr, const char *repo_id);
+
+#ifdef WIN32
+/* Add to refresh queue */
+void
+seaf_sync_manager_add_refresh_path (SeafSyncManager *mgr, const char *path);
+
+/* Refresh immediately. */
+void
+seaf_sync_manager_refresh_path (SeafSyncManager *mgr, const char *path);
+#endif
+
+void
+seaf_sync_manager_set_task_error_code (SeafSyncManager *mgr,
+                                       const char *repo_id,
+                                       int error);
+
+void
+seaf_sync_manager_update_repo (SeafSyncManager *manager, SeafRepo *repo,
+                               const char *commit_id);
+
+void
+seaf_sync_manager_check_locks_and_folder_perms (SeafSyncManager *manager,
+                                                const char *server_url);
 #endif

@@ -6,6 +6,9 @@
 #include "seafile-session.h"
 #include "db.h"
 
+#define KEY_CLIENT_ID "client_id"
+#define KEY_CLIENT_NAME "client_name"
+
 #define KEY_MONITOR_ID  "monitor_id"
 #define KEY_CHECK_REPO_PERIOD "check_repo_period"
 #define KEY_DB_HOST "db_host"
@@ -14,11 +17,31 @@
 #define KEY_DB_NAME "db_name"
 #define KEY_UPLOAD_LIMIT "upload_limit"
 #define KEY_DOWNLOAD_LIMIT "download_limit"
+#define KEY_CDC_AVERAGE_BLOCK_SIZE "block_size"
 #define KEY_ALLOW_INVALID_WORKTREE "allow_invalid_worktree"
 #define KEY_ALLOW_REPO_NOT_FOUND_ON_SERVER "allow_repo_not_found_on_server"
 #define KEY_SYNC_EXTRA_TEMP_FILE "sync_extra_temp_file"
+#define KEY_DISABLE_BLOCK_HASH "disable_block_hash"
+#define KEY_HIDE_WINDOWS_INCOMPATIBLE_PATH_NOTIFICATION "hide_windows_incompatible_path_notification"
+#define KEY_IGNORE_SYMLINKS "ignore_symlinks"
+
+/* Http sync settings. */
 #define KEY_ENABLE_HTTP_SYNC "enable_http_sync"
 #define KEY_DISABLE_VERIFY_CERTIFICATE "disable_verify_certificate"
+
+/* Http sync proxy settings. */
+#define KEY_USE_PROXY "use_proxy"
+#define KEY_PROXY_TYPE "proxy_type"
+#define KEY_PROXY_ADDR "proxy_addr"
+#define KEY_PROXY_PORT "proxy_port"
+#define KEY_PROXY_USERNAME "proxy_username"
+#define KEY_PROXY_PASSWORD "proxy_password"
+#define PROXY_TYPE_HTTP "http"
+#define PROXY_TYPE_SOCKS "socks"
+#define KEY_DELETE_CONFIRM_THRESHOLD "delete_confirm_threshold"
+
+gboolean
+seafile_session_config_exists (SeafileSession *session, const char *key);
 
 /*
  * Returns: config value in string. The string should be freed by caller. 

@@ -1,0 +1,23 @@
+{
+    "dependencies": [
+        "argon2",
+        "getopt",
+        "glib",
+        "jansson",
+        "libevent",
+        "libwebsockets",
+        {
+            "name": "openssl",
+            "version>=": "3.6.3#0"
+        },
+        "pthreads",
+        "sqlite3",
+        "zlib",
+        {
+            "name": "curl",
+            "features": [
+                "openssl"
+            ]
+        }
+    ]
+}

@@ -58,18 +58,13 @@ build-stamp
 debian/files
 debian/seafile
 debian/*.substvars
-lib/searpc-marshal.h
-lib/searpc-signature.h
 lib/*.tmp
 lib/dir.c
 lib/dirent.c
-lib/seafile-object.h
-lib/task.c
 lib/webaccess.c
 lib/branch.c
 lib/commit.c
 lib/crypt.c
-lib/repo.c
 lib/copy-task.c
 app/seafile
 app/seafserv-tool
@@ -125,3 +120,15 @@ fuse/seaf-fuse
 server/gc/seaf-migrate
 /compile
 /test-driver
+*.dmp
+/symbols
+
+# visual studio
+Debug
+msi/custom/x64
+msi/ext.wxi
+msi/shell.wxs
+seafile.vcxproj.user
+x64
+msi/custom/seafile_custom.vcxproj.user
+msi/custom/.vs

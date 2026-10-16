@@ -4,17 +4,18 @@
 
 #include "seafile-session.h"
 #include "utils.h"
-#include "seaf-utils.h"
 #include "block-mgr.h"
 #include "log.h"
 
 #include <stdio.h>
 #include <errno.h>
+#ifndef WIN32
 #include <unistd.h>
+#include <dirent.h>
+#endif
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/types.h>
-#include <dirent.h>
 #include <glib/gstdio.h>
 
 #include "block-backend.h"
@@ -37,7 +38,7 @@ seaf_block_manager_new (struct _SeafileSession *seaf,
 
     mgr->backend = block_backend_fs_new (seaf_dir, seaf->tmp_file_dir);
     if (!mgr->backend) {
-        g_warning ("[Block mgr] Failed to load backend.\n");
+        seaf_warning ("[Block mgr] Failed to load backend.\n");
         goto onerror;
     }
 
@@ -63,6 +64,10 @@ seaf_block_manager_open_block (SeafBlockManager *mgr,
                                const char *block_id,
                                int rw_type)
 {
+    if (!store_id || !is_uuid_valid(store_id) ||
+        !block_id || !is_object_id_valid(block_id))
+        return NULL;
+
     return mgr->backend->open_block (mgr->backend,
                                      store_id, version,
                                      block_id, rw_type);
@@ -95,7 +100,7 @@ void
 seaf_block_manager_block_handle_free (SeafBlockManager *mgr,
                                       BlockHandle *handle)
 {
-    return mgr->backend->block_handle_free (mgr->backend, handle);
+    mgr->backend->block_handle_free (mgr->backend, handle);
 }
 
 int
@@ -110,6 +115,10 @@ gboolean seaf_block_manager_block_exists (SeafBlockManager *mgr,
                                           int version,
                                           const char *block_id)
 {
+    if (!store_id || !is_uuid_valid(store_id) ||
+        !block_id || !is_object_id_valid(block_id))
+        return FALSE;
+
     return mgr->backend->exists (mgr->backend, store_id, version, block_id);
 }
 
@@ -119,6 +128,10 @@ seaf_block_manager_remove_block (SeafBlockManager *mgr,
                                  int version,
                                  const char *block_id)
 {
+    if (!store_id || !is_uuid_valid(store_id) ||
+        !block_id || !is_object_id_valid(block_id))
+        return -1;
+
     return mgr->backend->remove_block (mgr->backend, store_id, version, block_id);
 }
 
@@ -128,6 +141,10 @@ seaf_block_manager_stat_block (SeafBlockManager *mgr,
                                int version,
                                const char *block_id)
 {
+    if (!store_id || !is_uuid_valid(store_id) ||
+        !block_id || !is_object_id_valid(block_id))
+        return NULL;
+
     return mgr->backend->stat_block (mgr->backend, store_id, version, block_id);
 }
 
@@ -205,42 +222,46 @@ seaf_block_manager_verify_block (SeafBlockManager *mgr,
     BlockHandle *h;
     char buf[10240];
     int n;
-    SHA_CTX ctx;
-    guint8 sha1[20];
-    char check_id[41];
+    GChecksum *cs;
+    const char *check_id;
+    gboolean ret;
 
     h = seaf_block_manager_open_block (mgr,
                                        store_id, version,
                                        block_id, BLOCK_READ);
     if (!h) {
-        seaf_warning ("Failed to open block %.8s.\n", block_id);
+        seaf_warning ("Failed to open block %s:%.8s.\n", store_id, block_id);
         *io_error = TRUE;
         return FALSE;
     }
 
-    SHA1_Init (&ctx);
+    cs = g_checksum_new (G_CHECKSUM_SHA1);
     while (1) {
         n = seaf_block_manager_read_block (mgr, h, buf, sizeof(buf));
         if (n < 0) {
-            seaf_warning ("Failed to read block %.8s.\n", block_id);
+            seaf_warning ("Failed to read block %s:%.8s.\n", store_id, block_id);
             *io_error = TRUE;
+            g_checksum_free (cs);
             return FALSE;
         }
         if (n == 0)
             break;
 
-        SHA1_Update (&ctx, buf, n);
+        g_checksum_update (cs, (guchar *)buf, n);
     }
 
     seaf_block_manager_close_block (mgr, h);
+    seaf_block_manager_block_handle_free (mgr, h);
 
-    SHA1_Final (sha1, &ctx);
-    rawdata_to_hex (sha1, check_id, 20);
+    check_id = g_checksum_get_string (cs);
 
     if (strcmp (check_id, block_id) == 0)
-        return TRUE;
+        ret = TRUE;
     else
-        return FALSE;
+        ret = FALSE;
+
+    g_checksum_free (cs);
+    return ret;
 }
 
 int
@@ -248,4 +269,11 @@ seaf_block_manager_remove_store (SeafBlockManager *mgr,
                                  const char *store_id)
 {
     return mgr->backend->remove_store (mgr->backend, store_id);
+}
+
+int
+seaf_block_manager_rewind_block (SeafBlockManager *mgr,
+                                 BlockHandle *handle)
+{
+    return mgr->backend->rewind_block (mgr->backend, handle);
 }

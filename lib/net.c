@@ -1,10 +1,16 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 #ifdef WIN32
     #define WINVER 0x0501
+    #include <inttypes.h>
+    #include <winsock2.h>
+    #include <ctype.h>
+    #include <ws2tcpip.h>
 #endif
 #include "include.h"
 
+#ifndef WIN32
 #include <unistd.h>
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -12,10 +18,6 @@
 
 
 #ifdef WIN32
-    #include <inttypes.h>
-    #include <winsock2.h>
-    #include <ctype.h>
-    #include <ws2tcpip.h>
     #define UNUSED 
 #else
     #include <sys/types.h>

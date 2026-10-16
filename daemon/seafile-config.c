@@ -5,6 +5,13 @@
 
 #include "seafile-config.h"
 
+gboolean
+seafile_session_config_exists (SeafileSession *session, const char *key)
+{
+    return sqlite_check_for_existence (session->config_db,
+                                       "SELECT 1 FROM Config WHERE key = ?",
+                                       1, "string", key);
+}
 
 static gboolean
 get_value (sqlite3_stmt *stmt, void *data)
@@ -19,14 +26,12 @@ get_value (sqlite3_stmt *stmt, void *data)
 static char *
 config_get_string (sqlite3 *config_db, const char *key)
 {
-    char sql[256];
     char *value = NULL;
 
-    snprintf (sql, sizeof(sql),
-              "SELECT value FROM Config WHERE key='%s';",
-              key);
-    if (sqlite_foreach_selected_row (config_db, sql,
-                                     get_value, &value) < 0)
+    if (sqlite_foreach_selected_row (config_db,
+                                     "SELECT value FROM Config WHERE key=?",
+                                     get_value, &value,
+                                     1, "string", key) < 0)
         return NULL;
 
     return value;
@@ -81,13 +86,15 @@ seafile_session_config_set_string (SeafileSession *session,
                                    const char *key,
                                    const char *value)
 {
-    char sql[256];
-
-    sqlite3_snprintf (sizeof(sql), sql,
-                      "REPLACE INTO Config VALUES ('%q', '%q');",
-                      key, value);
-    if (sqlite_query_exec (session->config_db, sql) < 0)
+    if (sqlite_query_exec (session->config_db,
+                           "REPLACE INTO Config VALUES (?, ?)",
+                           2, "string", key, "string", value) < 0)
         return -1;
+
+    if (g_strcmp0 (key, KEY_CLIENT_NAME) == 0) {
+        g_free (session->client_name);
+        session->client_name = g_strdup(value);
+    }
 
     if (g_strcmp0(key, KEY_SYNC_EXTRA_TEMP_FILE) == 0) {
         if (g_strcmp0(value, "true") == 0)
@@ -96,18 +103,62 @@ seafile_session_config_set_string (SeafileSession *session,
             session->sync_extra_temp_file = FALSE;
     }
 
-    if (g_strcmp0(key, KEY_ENABLE_HTTP_SYNC) == 0) {
-        if (g_strcmp0(value, "true") == 0)
-            session->enable_http_sync = TRUE;
-        else
-            session->enable_http_sync = FALSE;
-    }
-
     if (g_strcmp0(key, KEY_DISABLE_VERIFY_CERTIFICATE) == 0) {
         if (g_strcmp0(value, "true") == 0)
             session->disable_verify_certificate = TRUE;
         else
             session->disable_verify_certificate = FALSE;
+    }
+
+    if (g_strcmp0(key, KEY_USE_PROXY) == 0) {
+        if (g_strcmp0(value, "true") == 0)
+            session->use_http_proxy = TRUE;
+        else {
+            session->use_http_proxy = FALSE;
+            // Disabling proxy completes with KEY_USE_PROXY=false,
+            // so reconnect notification server here to drop the old proxied connection.
+#if defined WIN32 || defined __APPLE__ || defined COMPILE_LINUX_WS
+            if (session->notif_mgr)
+                seaf_notif_manager_reconnect_servers (session->notif_mgr);
+#endif
+        }
+    }
+
+    if (g_strcmp0(key, KEY_PROXY_TYPE) == 0) {
+        session->http_proxy_type =
+            g_strcmp0(value, "none") == 0 ? NULL : g_strdup(value);
+    }
+
+    if (g_strcmp0(key, KEY_PROXY_ADDR) == 0) {
+        session->http_proxy_addr = g_strdup(value);
+    }
+
+    if (g_strcmp0(key, KEY_PROXY_USERNAME) == 0) {
+        session->http_proxy_username = g_strdup(value);
+    }
+
+    if (g_strcmp0(key, KEY_PROXY_PASSWORD) == 0) {
+        session->http_proxy_password = g_strdup(value);
+        // The RPC caller updates proxy settings key by key and writes KEY_PROXY_PASSWORD last when proxy is enabled,
+        // so reconnect notifications here to pick up the complete new proxy settings.
+#if defined WIN32 || defined __APPLE__ || defined COMPILE_LINUX_WS
+        if (session->notif_mgr)
+            seaf_notif_manager_reconnect_servers (session->notif_mgr);
+#endif
+    }
+
+    if (g_strcmp0(key, KEY_HIDE_WINDOWS_INCOMPATIBLE_PATH_NOTIFICATION) == 0) {
+        if (g_strcmp0(value, "true") == 0)
+            session->hide_windows_incompatible_path_notification = TRUE;
+        else
+            session->hide_windows_incompatible_path_notification = FALSE;
+    }
+
+    if (g_strcmp0(key, KEY_IGNORE_SYMLINKS) == 0) {
+        if (g_strcmp0(value, "true") == 0)
+            session->ignore_symlinks = TRUE;
+        else
+            session->ignore_symlinks = FALSE;
     }
 
     return 0;
@@ -118,13 +169,21 @@ seafile_session_config_set_int (SeafileSession *session,
                                 const char *key,
                                 int value)
 {
-    char sql[256];
-
-    sqlite3_snprintf (sizeof(sql), sql,
-                      "REPLACE INTO Config VALUES ('%q', %d);",
-                      key, value);
-    if (sqlite_query_exec (session->config_db, sql) < 0)
+    char *value_str = g_strdup_printf ("%d", value);
+    if (sqlite_query_exec (session->config_db,
+                           "REPLACE INTO Config VALUES (?, ?)",
+                           2, "string", key, "string", value_str) < 0) {
+        g_free (value_str);
         return -1;
+    }
+    g_free (value_str);
+
+    if (g_strcmp0(key, KEY_PROXY_PORT) == 0) {
+        session->http_proxy_port = value;
+    }
+    if (g_strcmp0(key, KEY_DELETE_CONFIRM_THRESHOLD) == 0) {
+        session->delete_confirm_threshold = value;
+    }
 
     return 0;
 }
@@ -145,7 +204,7 @@ seafile_session_config_open_db (const char *db_path)
     char *sql = "CREATE TABLE IF NOT EXISTS Config ("
         "key TEXT PRIMARY KEY, "
         "value TEXT);";
-    sqlite_query_exec (db, sql);
+    sqlite_query_exec (db, sql, 0);
 
     return db;
 }

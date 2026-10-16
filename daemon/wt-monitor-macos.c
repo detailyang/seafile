@@ -9,16 +9,26 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <ccnet/job-mgr.h>
+#include "job-mgr.h"
 #include "seafile-session.h"
 #include "utils.h"
 #include "wt-monitor.h"
 #define DEBUG_FLAG SEAFILE_DEBUG_WATCH
 #include "log.h"
 
+#define RENAME_EXPIRE_TIME 10
+
+typedef struct RenameInfo {
+    char *old_path;
+    char *old_event_path;
+    gboolean processing;
+    gint64 expire;
+} RenameInfo;
+
 typedef struct RepoWatchInfo {
     WTStatus *status;
     char *worktree;
+    RenameInfo *rename_info;
 } RepoWatchInfo;
 
 struct SeafWTMonitorPriv {
@@ -33,6 +43,27 @@ add_event_to_queue (WTStatus *status,
 
 static void handle_watch_command (SeafWTMonitor *monitor, WatchCommand *cmd);
 
+inline static void
+set_rename_processing_state (RenameInfo *info, const char *path, const char *event_path)
+{
+    gint64 now = (gint64)time(NULL);
+    info->old_path = g_strdup(path);
+    info->old_event_path = g_strdup(event_path);
+    info->processing = TRUE;
+    info->expire = now + RENAME_EXPIRE_TIME;
+}
+
+inline static void
+unset_rename_processing_state (RenameInfo *info)
+{
+    g_free (info->old_path);
+    g_free (info->old_event_path);
+    info->old_path = NULL;
+    info->old_event_path = NULL;
+    info->processing = FALSE;
+    info->expire = 0;
+}
+
 /* RepoWatchInfo */
 
 static RepoWatchInfo *
@@ -43,6 +74,7 @@ create_repo_watch_info (const char *repo_id, const char *worktree)
     RepoWatchInfo *info = g_new0 (RepoWatchInfo, 1);
     info->status = status;
     info->worktree = g_strdup(worktree);
+    info->rename_info = g_new0 (RenameInfo, 1);
 
     return info;
 }
@@ -52,7 +84,136 @@ free_repo_watch_info (RepoWatchInfo *info)
 {
     wt_status_unref (info->status);
     g_free (info->worktree);
+    g_free (info->rename_info->old_path);
+    g_free (info->rename_info);
     g_free (info);
+}
+
+// Since macOS does not distinguish filename case, we need to perform an additional check during rename operations to verify that the filename matches the actual name exactly.
+static gboolean
+is_filename_case_conflict (const char *eventPath)
+{
+    gboolean ret = FALSE;
+    int fd = -1;
+
+    fd = open (eventPath, O_RDONLY);
+    if (fd < 0) {
+        goto out;
+    }
+
+    char buffer[SEAF_PATH_MAX];
+    if (fcntl (fd, F_GETPATH, buffer) < 0) {
+        goto out;
+    }
+
+    if (strcasecmp (buffer, eventPath) == 0 &&
+        strcmp (buffer, eventPath) != 0) {
+        ret = TRUE;
+    }
+
+out:
+    if (fd >= 0)
+        close (fd);
+    return ret;
+}
+
+static void
+check_and_handle_rename (WTStatus *status, RenameInfo *rename_info,
+                        const char *eventPath, const char *filename)
+{
+    struct stat st;
+    gboolean old_path_exists = TRUE;
+    gboolean new_path_exists = TRUE;
+
+    if ((stat (rename_info->old_event_path, &st) < 0 && errno == ENOENT) ||
+         is_filename_case_conflict (rename_info->old_event_path)) {
+        old_path_exists = FALSE;
+    }
+    if ((stat (eventPath, &st) < 0 && errno == ENOENT) ||
+         is_filename_case_conflict (eventPath)) {
+        new_path_exists = FALSE;
+    }
+
+    if (!old_path_exists && new_path_exists) {
+        seaf_debug ("Rename dir %s to %s\n", rename_info->old_path, filename);
+        add_event_to_queue (status, WT_EVENT_RENAME, rename_info->old_path, filename);
+    } else {
+        if (old_path_exists) {
+            seaf_debug ("Rename: old path exist, add create event for %s\n", rename_info->old_path);
+            add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, rename_info->old_path, NULL);
+        } else {
+            seaf_debug ("Rename: old path doesn't exist, add delete event for %s\n", rename_info->old_path);
+            add_event_to_queue (status, WT_EVENT_DELETE, rename_info->old_path, NULL);
+        }
+        if (new_path_exists) {
+            seaf_debug ("Rename: new path exist, add create event for %s\n", filename);
+            add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, filename, NULL);
+        } else {
+            seaf_debug ("Rename: new path doesn't exist, add delete event for %s\n", filename);
+            add_event_to_queue (status, WT_EVENT_DELETE, filename, NULL);
+        }
+    }
+
+    unset_rename_processing_state (rename_info);
+}
+
+static void
+handle_rename (RepoWatchInfo *info,
+               const FSEventStreamEventFlags eventFlags,
+               const char *eventPath,
+               const char *filename)
+{
+    WTStatus *status = info->status;
+    RenameInfo *rename_info = info->rename_info;
+    gboolean is_dir = FALSE;
+    gint64 now = (gint64)time(NULL);
+
+    // If processing is set for more than 10 seconds, the system may not generate paired renaming events.
+    // In this case, we add creation event or deletion event based on whether the file exists.
+    if (rename_info->expire > 0 && now >= rename_info->expire) {
+        struct stat st;
+        if ((stat (rename_info->old_event_path, &st) < 0 && errno == ENOENT) || is_filename_case_conflict (eventPath)) {
+            seaf_debug ("Rename info expired, delete renamed dir %s\n", rename_info->old_path);
+            add_event_to_queue (status, WT_EVENT_DELETE, rename_info->old_path, NULL);
+        } else {
+            seaf_debug ("Rename info expired, create renamed dir %s\n", rename_info->old_path);
+            add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, rename_info->old_path, NULL);
+        }
+        unset_rename_processing_state (rename_info);
+    }
+
+    if (!(eventFlags & kFSEventStreamEventFlagItemRenamed)) {
+        return;
+    }
+
+    seaf_debug ("Rename flag set for %s \n", filename);
+
+    if (eventFlags & kFSEventStreamEventFlagItemIsDir) {
+        is_dir = TRUE;
+    }
+
+    // It is not always possible to reliably determine if a file has been renamed on  Mac, as system events do not guarantee that renamed files appear consecutively.
+    // However, we can detect directory renaming, and handling directory renaming is generally not overly complex.
+    if (is_dir) {
+        if (!rename_info->processing) {
+            seaf_debug ("Move %s ->\n", filename);
+            set_rename_processing_state (rename_info, filename, eventPath);
+        } else {
+            seaf_debug ("Move -> %s.\n", filename);
+            // If a dir is renamed, the old path should not exist, and the new path should exist.
+            // If this condition is not met, split the renaming event into deletion event or creation event based on whether the dir exists.
+            check_and_handle_rename (status, rename_info, eventPath, filename);
+        }
+    } else {
+        struct stat st;
+        if ((stat (eventPath, &st) < 0 && errno == ENOENT) || is_filename_case_conflict (eventPath)) {
+            seaf_debug ("Delete renamed file %s\n", filename);
+            add_event_to_queue (status, WT_EVENT_DELETE, filename, NULL);
+        } else {
+            seaf_debug ("Create renamed file %s\n", filename);
+            add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, filename, NULL);
+        }
+    }
 }
 
 static void
@@ -76,6 +237,9 @@ add_event_to_queue (WTStatus *status,
     case WT_EVENT_CREATE_OR_UPDATE:
         name = "create/update";
         break;
+    case WT_EVENT_SCAN_DIR:
+        name = "scan dir";
+        break;
     case WT_EVENT_DELETE:
         name = "delete";
         break;
@@ -97,6 +261,16 @@ add_event_to_queue (WTStatus *status,
     pthread_mutex_lock (&status->q_lock);
     g_queue_push_tail (status->event_q, event);
     pthread_mutex_unlock (&status->q_lock);
+
+    if (type == WT_EVENT_CREATE_OR_UPDATE) {
+        pthread_mutex_lock (&status->ap_q_lock);
+
+        char *last = g_queue_peek_tail (status->active_paths);
+        if (!last || strcmp(last, path) != 0)
+            g_queue_push_tail (status->active_paths, g_strdup(path));
+
+        pthread_mutex_unlock (&status->ap_q_lock);
+    }
 }
 
 static void
@@ -104,32 +278,46 @@ process_one_event (const char* eventPath,
                    RepoWatchInfo *info,
                    const char *worktree,
                    const FSEventStreamEventId eventId,
-                   const FSEventStreamEventFlags eventFlags)
+                   const FSEventStreamEventFlags eventFlags,
+                   gboolean last_event)
 {
     WTStatus *status = info->status;
     char *filename;
+    char *event_path_nfc;
     const char *tmp;
-    tmp = eventPath + strlen(worktree);
+    struct stat buf;
+
+    event_path_nfc = g_utf8_normalize (eventPath, -1, G_NORMALIZE_NFC);
+
+    tmp = event_path_nfc + strlen(worktree);
     if (*tmp == '/')
         tmp++;
     filename = g_strdup(tmp);
+    g_free (event_path_nfc);
 
-    /* Reinterpreted RENAMED as combine of CREATED or DELETED event */
-    if (eventFlags & kFSEventStreamEventFlagItemRenamed) {
-        seaf_debug ("Rename Event Affected: %s \n", filename);
-        struct stat buf;
-        if (stat (eventPath, &buf)) {
-            /* ret = -1, file is gone */
+    /* Path for folder returned from system may contain a '/' at the end. */
+    int len = strlen(filename);
+    if (len > 0 && filename[len - 1] == '/')
+        filename[len - 1] = 0;
+
+    handle_rename (info, eventFlags, eventPath, filename);
+
+    if (eventFlags & kFSEventStreamEventFlagItemRemoved) {
+        seaf_debug ("Deleted flag set for %s.\n", filename);
+        if (stat (eventPath, &buf) < 0) {
             add_event_to_queue (status, WT_EVENT_DELETE, filename, NULL);
-        } else {
-            /* ret = 0, file is here, but rename behaviour is unknown to us */
+        }
+    }
+
+    if (eventFlags & kFSEventStreamEventFlagItemModified) {
+        seaf_debug ("Modified flag set for %s.\n", filename);
+        if (stat (eventPath, &buf) == 0) {
             add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, filename, NULL);
         }
-    } else if (eventFlags & kFSEventStreamEventFlagItemModified) {
-        seaf_debug ("Modified %s.\n", filename);
-        add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, filename, NULL);
-    } else if (eventFlags & kFSEventStreamEventFlagItemCreated) {
-        seaf_debug ("Created %s.\n", filename);
+    }
+
+    if (eventFlags & kFSEventStreamEventFlagItemCreated) {
+        seaf_debug ("Created flag set for %s.\n", filename);
          /**
           * no need to rechecking recursively in FSEventStream
           *
@@ -138,24 +326,74 @@ process_one_event (const char* eventPath,
           * kFSEventStreamEventFlagItemIsDir
           * kFSEventStreamEventFlagItemIsSymlink
           */
-        add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, filename, NULL);
-    } else if (eventFlags & kFSEventStreamEventFlagItemRemoved) {
-        seaf_debug ("Deleted %s.\n", filename);
-        add_event_to_queue (status, WT_EVENT_DELETE, filename, NULL);
-    } else if (eventFlags & kFSEventStreamEventFlagItemXattrMod) {
-        seaf_debug ("XattrMod %s.\n", filename);
-        add_event_to_queue (status, WT_EVENT_ATTRIB, filename, NULL);
-    } else if (eventFlags & kFSEventStreamEventFlagRootChanged) {
-        /* An empty path indicates repo-mgr to scan the whole worktree. */
-        seaf_debug ("RootChange event.\n");
-        add_event_to_queue (info->status, WT_EVENT_CREATE_OR_UPDATE, "", NULL);
-    } else {
-        seaf_debug ("Unhandled event with flags %x.\n", eventFlags);
+        if (stat (eventPath, &buf) == 0) {
+            add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, filename, NULL);
+        }
+    }
+
+    // If this is the last event, check rename_info and split the renaming event into deletion event or creation event.
+    RenameInfo *rename_info = info->rename_info;
+    if (last_event && rename_info->processing) {
+        if (stat (rename_info->old_event_path, &buf) < 0 && errno == ENOENT) {
+            seaf_debug ("Delete renamed file %s\n", rename_info->old_path);
+            add_event_to_queue (status, WT_EVENT_DELETE, rename_info->old_path, NULL);
+        } else {
+            seaf_debug ("Create renamed file %s\n", rename_info->old_path);
+            add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, rename_info->old_path, NULL);
+        }
+        unset_rename_processing_state (rename_info);
     }
 
     g_free (filename);
     g_atomic_int_set (&info->status->last_changed, (gint)time(NULL));
 }
+
+#if 0
+static void
+process_one_event (const char* eventPath,
+                   RepoWatchInfo *info,
+                   const char *worktree,
+                   const FSEventStreamEventId eventId,
+                   const FSEventStreamEventFlags eventFlags)
+{
+    WTStatus *status = info->status;
+    char *dirname;
+    char *event_path_nfc;
+    const char *tmp;
+
+    event_path_nfc = g_utf8_normalize (eventPath, -1, G_NORMALIZE_NFC);
+
+    tmp = event_path_nfc + strlen(worktree);
+    if (*tmp == '/')
+        tmp++;
+    dirname = g_strdup(tmp);
+    g_free (event_path_nfc);
+
+    /* Path for folder returned from system may contain a '/' at the end. */
+    int len = strlen(dirname);
+    if (len > 0 && dirname[len - 1] == '/')
+        dirname[len - 1] = 0;
+
+    if (eventFlags & kFSEventStreamEventFlagItemRenamed) {
+        seaf_debug ("Rename event in dir: %s \n", dirname);
+    } else if (eventFlags & kFSEventStreamEventFlagItemModified) {
+        seaf_debug ("Modified event in dir %s.\n", dirname);
+    } else if (eventFlags & kFSEventStreamEventFlagItemCreated) {
+        seaf_debug ("Created event in dir %s.\n", dirname);
+    } else if (eventFlags & kFSEventStreamEventFlagItemRemoved) {
+        seaf_debug ("Deleted event in dir %s.\n", dirname);
+    } else if (eventFlags & kFSEventStreamEventFlagItemXattrMod) {
+        seaf_debug ("XattrMod event in dir %s.\n", dirname);
+    } else {
+        seaf_debug ("Unhandled event with flags %x.\n", eventFlags);
+    }
+
+    add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, dirname, NULL);
+
+    g_free (dirname);
+    g_atomic_int_set (&info->status->last_changed, (gint)time(NULL));
+}
+#endif
 
 static void
 stream_callback (ConstFSEventStreamRef streamRef,
@@ -166,11 +404,9 @@ stream_callback (ConstFSEventStreamRef streamRef,
                       const FSEventStreamEventId eventIds[])
 {
     RepoWatchInfo *info;
-    char *repo_id;
     SeafWTMonitor *monitor = (SeafWTMonitor *)clientCallBackInfo;
     SeafWTMonitorPriv *priv = monitor->priv;
     char **paths = (char **)eventPaths;
-    char *dir;
 
     info = g_hash_table_lookup (priv->info_hash, (gpointer)(long)streamRef);
     if (!info) {
@@ -183,7 +419,7 @@ stream_callback (ConstFSEventStreamRef streamRef,
         seaf_debug("%ld Change %llu in %s, flags %x\n", (long)CFRunLoopGetCurrent(),
                    eventIds[i], paths[i], eventFlags[i]);
         process_one_event (paths[i], info, info->worktree,
-                           eventIds[i], eventFlags[i]);
+                           eventIds[i], eventFlags[i], i==(numEvents - 1));
     }
 }
 
@@ -194,14 +430,18 @@ add_watch (SeafWTMonitor *monitor, const char* repo_id, const char* worktree)
     RepoWatchInfo *info;
     double latency = 0.25; /* unit: second */
 
+    char *worktree_nfd = g_utf8_normalize (worktree, -1, G_NORMALIZE_NFD);
+
     CFStringRef mypaths[1];
     mypaths[0] = CFStringCreateWithCString (kCFAllocatorDefault,
-                                                    worktree, kCFStringEncodingUTF8);
+                                            worktree_nfd, kCFStringEncodingUTF8);
+    g_free (worktree_nfd);
     CFArrayRef pathsToWatch = CFArrayCreate(NULL, (const void **)mypaths, 1, NULL);
     FSEventStreamRef stream;
 
     /* Create the stream, passing in a callback */
-    seaf_debug("Use kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagWatchRoot\n");
+    // kFSEventStreamCreateFlagFileEvents does not work for libraries with name
+    // containing accent characters.
     struct FSEventStreamContext ctx = {0, monitor, NULL, NULL, NULL};
     stream = FSEventStreamCreate(kCFAllocatorDefault,
                                  stream_callback,
@@ -209,7 +449,7 @@ add_watch (SeafWTMonitor *monitor, const char* repo_id, const char* worktree)
                                  pathsToWatch,
                                  kFSEventStreamEventIdSinceNow,
                                  latency,
-                                 kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagWatchRoot
+                                 kFSEventStreamCreateFlagFileEvents
                                  );
 
     CFRelease (mypaths[0]);
@@ -233,8 +473,8 @@ add_watch (SeafWTMonitor *monitor, const char* repo_id, const char* worktree)
     g_hash_table_insert (priv->info_hash, (gpointer)(long)stream, info);
     pthread_mutex_unlock (&priv->hash_lock);
 
-    /* An empty path indicates repo-mgr to scan the whole worktree. */
-    add_event_to_queue (info->status, WT_EVENT_CREATE_OR_UPDATE, "", NULL);
+    /* A special event indicates repo-mgr to scan the whole worktree. */
+    add_event_to_queue (info->status, WT_EVENT_SCAN_DIR, "", NULL);
     return stream;
 }
 
@@ -247,7 +487,7 @@ command_read_cb (CFFileDescriptorRef fdref,
     WatchCommand cmd;
     int n;
 
-    n = pipereadn (monitor->cmd_pipe[0], &cmd, sizeof(cmd));
+    n = seaf_pipe_readn (monitor->cmd_pipe[0], &cmd, sizeof(cmd));
     if (n != sizeof(cmd)) {
         seaf_warning ("[wt mon] failed to read command.\n");
         CFFileDescriptorEnableCallBacks (fdref, kCFFileDescriptorReadCallBack);
@@ -326,7 +566,7 @@ reply_watch_command (SeafWTMonitor *monitor, int result)
 {
     int n;
 
-    n = pipewriten (monitor->res_pipe[1], &result, sizeof(int));
+    n = seaf_pipe_writen (monitor->res_pipe[1], &result, sizeof(int));
     if (n != sizeof(int))
         seaf_warning ("[wt mon] fail to write command result.\n");
 }

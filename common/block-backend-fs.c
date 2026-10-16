@@ -12,7 +12,9 @@
 
 #include <sys/stat.h>
 #include <fcntl.h>
+#ifndef WIN32
 #include <dirent.h>
+#endif
 
 #include "block-backend.h"
 #include "obj-store.h"
@@ -146,7 +148,7 @@ create_parent_path (const char *path)
         return 0;
     }
 
-    if (g_mkdir_with_parents (dir, 0777) < 0) {
+    if (checkdir_with_mkdir (dir) < 0) {
         seaf_warning ("Failed to create object parent path: %s.\n", dir);
         g_free (dir);
         return -1;
@@ -167,13 +169,14 @@ block_backend_fs_commit_block (BlockBackend *bend,
     get_block_path (bend, handle->block_id, path, handle->store_id, handle->version);
 
     if (create_parent_path (path) < 0) {
-        seaf_warning ("Failed to create path for block %s.\n", handle->block_id);
+        seaf_warning ("Failed to create path for block %s:%s.\n",
+                      handle->store_id, handle->block_id);
         return -1;
     }
 
-    if (ccnet_rename (handle->tmp_file, path) < 0) {
-        seaf_warning ("[block bend] failed to commit block %s: %s\n",
-                   handle->block_id, strerror(errno));
+    if (g_rename (handle->tmp_file, path) < 0) {
+        seaf_warning ("[block bend] failed to commit block %s:%s: %s\n",
+                      handle->store_id, handle->block_id, strerror(errno));
         return -1;
     }
 
@@ -189,6 +192,7 @@ block_backend_fs_block_exists (BlockBackend *bend,
     char block_path[SEAF_PATH_MAX];
 
     get_block_path (bend, block_sha1, block_path, store_id, version);
+
     if (g_access (block_path, F_OK) == 0)
         return TRUE;
     else
@@ -220,8 +224,8 @@ block_backend_fs_stat_block (BlockBackend *bend,
 
     get_block_path (bend, block_id, path, store_id, version);
     if (seaf_stat (path, &st) < 0) {
-        seaf_warning ("[block bend] Failed to stat block %s at %s: %s.\n",
-                      block_id, path, strerror(errno));
+        seaf_warning ("[block bend] Failed to stat block %s:%s at %s: %s.\n",
+                      store_id, block_id, path, strerror(errno));
         return NULL;
     }
     block_md = g_new0(BMetadata, 1);
@@ -239,7 +243,8 @@ block_backend_fs_stat_block_by_handle (BlockBackend *bend,
     BMetadata *block_md;
 
     if (seaf_fstat (handle->fd, &st) < 0) {
-        seaf_warning ("[block bend] Failed to stat block %s.\n", handle->block_id);
+        seaf_warning ("[block bend] Failed to stat block %s:%s.\n",
+                      handle->store_id, handle->block_id);
         return NULL;
     }
     block_md = g_new0(BMetadata, 1);
@@ -334,8 +339,8 @@ block_backend_fs_copy (BlockBackend *bend,
     }
 
 #ifdef WIN32
-    if (!CreateHardLink (dst_path, src_path, NULL)) {
-        seaf_warning ("Failed to link %s to %s: %d.\n",
+    if (!CreateHardLinkA (dst_path, src_path, NULL)) {
+        seaf_warning ("Failed to link %s to %s: %lu.\n",
                       src_path, dst_path, GetLastError());
         return -1;
     }
@@ -376,6 +381,7 @@ block_backend_fs_remove_store (BlockBackend *bend, const char *store_id)
             seaf_warning ("Failed to open block dir %s.\n", path1);
             g_dir_close (dir1);
             g_free (path1);
+            g_free (block_dir);
             return -1;
         }
 
@@ -395,6 +401,13 @@ block_backend_fs_remove_store (BlockBackend *bend, const char *store_id)
     g_free (block_dir);
 
     return 0;
+}
+
+static int
+block_backend_fs_rewind_block (BlockBackend *bend,
+                              BHandle *handle)
+{
+    return seaf_util_lseek (handle->fd, 0, SEEK_SET);
 }
 
 static char *
@@ -466,13 +479,13 @@ block_backend_fs_new (const char *seaf_dir, const char *tmp_dir)
     priv->tmp_dir = g_strdup (tmp_dir);
     priv->tmp_dir_len = strlen (tmp_dir);
 
-    if (g_mkdir_with_parents (priv->block_dir, 0777) < 0) {
+    if (checkdir_with_mkdir (priv->block_dir) < 0) {
         seaf_warning ("Block dir %s does not exist and"
                    " is unable to create\n", priv->block_dir);
         goto onerror;
     }
 
-    if (g_mkdir_with_parents (tmp_dir, 0777) < 0) {
+    if (checkdir_with_mkdir (tmp_dir) < 0) {
         seaf_warning ("Blocks tmp dir %s does not exist and"
                    " is unable to create\n", tmp_dir);
         goto onerror;
@@ -491,6 +504,7 @@ block_backend_fs_new (const char *seaf_dir, const char *tmp_dir)
     bend->foreach_block = block_backend_fs_foreach_block;
     bend->remove_store = block_backend_fs_remove_store;
     bend->copy = block_backend_fs_copy;
+    bend->rewind_block = block_backend_fs_rewind_block;
 
     return bend;
 

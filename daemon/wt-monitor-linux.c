@@ -10,8 +10,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include <ccnet/job-mgr.h>
+#include "job-mgr.h"
 #include "seafile-session.h"
+#include "seafile-error.h"
 #include "utils.h"
 #include "wt-monitor.h"
 #define DEBUG_FLAG SEAFILE_DEBUG_WATCH
@@ -39,6 +40,8 @@ typedef struct RepoWatchInfo {
     WatchPathMapping *mapping;
     RenameInfo *rename_info;
     EventInfo last_event;
+    GList *ignore_list;
+    gboolean watch_error_reported;
     char *worktree;
 } RepoWatchInfo;
 
@@ -55,6 +58,14 @@ struct SeafWTMonitorPriv {
 static void *wt_monitor_job_linux (void *vmonitor);
 
 static void handle_watch_command (SeafWTMonitor *monitor, WatchCommand *cmd);
+
+static int handle_refresh_repo (SeafWTMonitor *monitor, const char *repo_id);
+
+static void
+add_event_to_queue (WTStatus *status,
+                    int type,
+                    const char *path,
+                    const char *new_path);
 
 static int
 add_watch_recursive (RepoWatchInfo *info, int in_fd,
@@ -132,6 +143,7 @@ create_repo_watch_info (const char *repo_id, const char *worktree)
     info->status = status;
     info->mapping = mapping;
     info->rename_info = rename_info;
+    info->ignore_list = seaf_repo_load_ignore_files (worktree);
     info->worktree = g_strdup(worktree);
 
     return info;
@@ -143,8 +155,19 @@ free_repo_watch_info (RepoWatchInfo *info)
     wt_status_unref (info->status);
     free_mapping (info->mapping);
     free_rename_info (info->rename_info);
+    seaf_repo_free_ignore_files (info->ignore_list);
     g_free (info->worktree);
     g_free (info);
+}
+
+static void
+add_watch_error_event (RepoWatchInfo *info, const char *path)
+{
+    if (info->watch_error_reported)
+        return;
+
+    info->watch_error_reported = TRUE;
+    add_event_to_queue (info->status, WT_EVENT_WATCH_ERROR, path, NULL);
 }
 
 static void
@@ -158,6 +181,9 @@ add_event_to_queue (WTStatus *status,
     case WT_EVENT_CREATE_OR_UPDATE:
         name = "create/update";
         break;
+    case WT_EVENT_SCAN_DIR:
+        name = "scan dir";
+        break;
     case WT_EVENT_DELETE:
         name = "delete";
         break;
@@ -170,6 +196,9 @@ add_event_to_queue (WTStatus *status,
     case WT_EVENT_ATTRIB:
         name = "attribute change";
         break;
+    case WT_EVENT_WATCH_ERROR:
+        name = "watch error";
+        break;
     default:
         name = "unknown";
     }
@@ -179,6 +208,16 @@ add_event_to_queue (WTStatus *status,
     pthread_mutex_lock (&status->q_lock);
     g_queue_push_tail (status->event_q, event);
     pthread_mutex_unlock (&status->q_lock);
+
+    if (type == WT_EVENT_CREATE_OR_UPDATE) {
+        pthread_mutex_lock (&status->ap_q_lock);
+
+        char *last = g_queue_peek_tail (status->active_paths);
+        if (!last || strcmp(last, path) != 0)
+            g_queue_push_tail (status->active_paths, g_strdup(path));
+
+        pthread_mutex_unlock (&status->ap_q_lock);
+    }
 }
 
 /*
@@ -276,6 +315,7 @@ is_modify_close_write (EventInfo *e1, struct inotify_event *e2)
     return ((e1->mask & IN_MODIFY) && (e2->mask & IN_CLOSE_WRITE));
 }
 
+#if 0
 static gboolean
 handle_consecutive_duplicate_event (RepoWatchInfo *info, struct inotify_event *event)
 {
@@ -296,6 +336,7 @@ handle_consecutive_duplicate_event (RepoWatchInfo *info, struct inotify_event *e
 
     return duplicate;
 }
+#endif
 
 static void
 process_one_event (int in_fd,
@@ -320,10 +361,14 @@ process_one_event (int in_fd,
         return;
     }
 
-    if (handle_consecutive_duplicate_event (info, event))
-        add_to_queue = FALSE;
+    /* if (handle_consecutive_duplicate_event (info, event)) */
+    /*     add_to_queue = FALSE; */
 
-    filename = g_build_filename (parent, event->name, NULL);
+    if (event->len == 0) {
+        filename = g_strdup (parent);
+    } else {
+        filename = g_build_filename (parent, event->name, NULL);
+    }
 
     handle_rename (in_fd, info, event, worktree, filename, last_event);
 
@@ -379,8 +424,9 @@ out:
 }
 
 static gboolean
-process_events (SeafWTMonitorPriv *priv, const char *repo_id, int in_fd)
+process_events (SeafWTMonitor *monitor, const char *repo_id, int in_fd)
 {
+    SeafWTMonitorPriv *priv = monitor->priv;
     char *event_buf = NULL;
     unsigned int buf_size;
     struct inotify_event *event;
@@ -464,7 +510,7 @@ wt_monitor_job_linux (void *vmonitor)
         }
 
         if (FD_ISSET (monitor->cmd_pipe[0], &fds)) {
-            n = pipereadn (monitor->cmd_pipe[0], &cmd, sizeof(cmd));
+            n = seaf_pipe_readn (monitor->cmd_pipe[0], &cmd, sizeof(cmd));
             if (n != sizeof(cmd)) {
                 seaf_warning ("[wt mon] failed to read command.\n");
                 continue;
@@ -477,7 +523,7 @@ wt_monitor_job_linux (void *vmonitor)
             repo_id = key;
             inotify_fd = (int)(long)value;
             if (FD_ISSET (inotify_fd, &fds))
-                process_events (priv, repo_id, inotify_fd);
+                process_events (monitor, repo_id, inotify_fd);
         }
     }
 
@@ -511,6 +557,12 @@ add_watch_recursive (RepoWatchInfo *info,
         goto out;
     }
 
+    if (path[0] != 0 && S_ISDIR(st.st_mode) &&
+        seaf_repo_check_ignore_file (info->ignore_list, full_path)) {
+        seaf_debug ("[wt mon] skip ignored dir %s.\n", full_path);
+        goto out;
+    }
+
     if (add_events && path[0] != 0)
         add_event_to_queue (info->status, WT_EVENT_CREATE_OR_UPDATE,
                             path, NULL);
@@ -522,6 +574,7 @@ add_watch_recursive (RepoWatchInfo *info,
         if (wd < 0) {
             seaf_warning ("[wt mon] fail to add watch to %s: %s.\n",
                           full_path, strerror(errno));
+            add_watch_error_event (info, path);
             goto out;
         }
 
@@ -595,8 +648,8 @@ add_watch (SeafWTMonitorPriv *priv, const char *repo_id, const char *worktree)
         return -1;
     }
 
-    /* An empty path indicates repo-mgr to scan the whole worktree. */
-    add_event_to_queue (info->status, WT_EVENT_CREATE_OR_UPDATE, "", NULL);
+    /* A special event indicates repo-mgr to scan the whole worktree. */
+    add_event_to_queue (info->status, WT_EVENT_SCAN_DIR, "", NULL);
 
     return inotify_fd;
 }
@@ -654,9 +707,31 @@ static int handle_rm_repo (SeafWTMonitor *monitor,
     return 0;
 }
 
-static int handle_refresh_repo (SeafWTMonitorPriv *priv, const char *repo_id)
+static int
+handle_refresh_repo (SeafWTMonitor *monitor, const char *repo_id)
 {
-    return 0;
+    SeafWTMonitorPriv *priv = monitor->priv;
+    gpointer key, value;
+    RepoWatchInfo *info;
+    char *worktree;
+    int ret;
+
+    if (!g_hash_table_lookup_extended (priv->handle_hash, repo_id, &key, &value))
+        return 0;
+
+    info = g_hash_table_lookup (priv->info_hash, value);
+    if (!info)
+        return -1;
+
+    // Copy worktree before calling handle_rm_repo, since handle_rm_repo frees info.
+    worktree = g_strdup (info->worktree);
+    info->watch_error_reported = FALSE;
+
+    handle_rm_repo (monitor, repo_id, value);
+    ret = handle_add_repo (priv, repo_id, worktree);
+
+    g_free (worktree);
+    return ret;
 }
 
 static void
@@ -664,7 +739,7 @@ reply_watch_command (SeafWTMonitor *monitor, int result)
 {
     int n;
 
-    n = pipewriten (monitor->res_pipe[1], &result, sizeof(int));
+    n = seaf_pipe_writen (monitor->res_pipe[1], &result, sizeof(int));
     if (n != sizeof(int))
         seaf_warning ("[wt mon] fail to write command result.\n");
 }
@@ -684,6 +759,8 @@ handle_watch_command (SeafWTMonitor *monitor, WatchCommand *cmd)
         if (handle_add_repo(priv, cmd->repo_id, cmd->worktree) < 0) {
             seaf_warning ("[wt mon] failed to watch worktree of repo %s.\n",
                           cmd->repo_id);
+            send_file_sync_error_notification (cmd->repo_id, NULL, "/",
+                                               SYNC_ERROR_ID_WATCH_FAILED);
             reply_watch_command (monitor, -1);
             return;
         }
@@ -701,7 +778,7 @@ handle_watch_command (SeafWTMonitor *monitor, WatchCommand *cmd)
         handle_rm_repo (monitor, cmd->repo_id, value);
         reply_watch_command (monitor, 0);
     } else if (cmd->type ==  CMD_REFRESH_WATCH) {
-        if (handle_refresh_repo (priv, cmd->repo_id) < 0) {
+        if (handle_refresh_repo (monitor, cmd->repo_id) < 0) {
             seaf_warning ("[wt mon] failed to refresh watch of repo %s.\n",
                           cmd->repo_id);
             reply_watch_command (monitor, -1);
